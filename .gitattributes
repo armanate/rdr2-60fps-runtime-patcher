@@ -1,0 +1,9 @@
+# keep LF line endings so the build and shell scripts work on every OS
+*.c text eol=lf
+*.h text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+*.elf binary

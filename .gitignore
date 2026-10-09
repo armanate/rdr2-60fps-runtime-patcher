@@ -1,0 +1,14 @@
+# build output (publish .elf files through GitHub Releases)
+*.elf
+*.o
+
+# Python
+__pycache__/
+*.pyc
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

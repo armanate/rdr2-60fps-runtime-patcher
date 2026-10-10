@@ -15,7 +15,22 @@
  *     bytes around them match the clean 1.32 eboot exactly, then reads back,
  *   - shows system notifications and writes its own log file,
  *   - exits. It does not patch the kernel, touch any other process, stay
- *     resident, or change any file besides its own log. */
+ *     resident, or change any file besides its own log and settings file.
+ *
+ * It also sets the render resolution,
+ * from LOG_DIR/scale.txt, which it creates with fake4k=1, 2160p=0:
+ *   - fake4k=1: on a 1080p TV the game believes the output is 4K and takes
+ *     its own PS4 Pro 4K checkerboard path (1920x2160 rebuilt to 3840x2160);
+ *     the PS5 scales the 4K frames to its 1080p output. In the apply step
+ *     (0x7865e8), before the node's screen size is copied to the video mode,
+ *     a cave sets it to 3840x2160 with checkerboard on; the snap to the TV's
+ *     own modes (0xa2512e) is skipped. On a 4K TV this changes nothing.
+ *   - 2160p=N (N <= 10, ratios up to 1): the PC Resolution Scale on top of a
+ *     4K checkerboard (e.g. 2 = 2/3, a 1440p checkerboard), set in the live
+ *     settings node where the apply step copies it (0x786846).
+ * Those patches have to land before the game applies its settings (about
+ * 1 s after it starts), so the game must start after this payload; when it
+ * doesn't, or anything doesn't match, only the 60fps patch is applied. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdarg.h>
@@ -41,7 +56,7 @@
 #include <ps5/klog.h>
 #include <ps5/mdbg.h>
 
-#define TOOL_VERSION "1.0"
+#define TOOL_VERSION "2.0"
 
 /* process name shown by payload managers (PLDMGR lists processes whose name
  * ends in .elf; the kernel keeps at most 19 characters) */
@@ -70,11 +85,62 @@ static const uint8_t PATCH_CTX[64] = {
 static const uint8_t PATCH_ORIG[PATCH_LEN] = {0x0f, 0x44, 0xf0}; /* cmove esi,eax */
 static const uint8_t PATCH_NEW[PATCH_LEN]  = {0x31, 0xf6, 0x90}; /* xor esi,esi; nop */
 
+/* ------------------------------------------------- resolution (see top) */
+
+/* RVAs: address - 0x400000 */
+#define RES_SCALE_RVA   0x386846u  /* mov eax,[r12+0x13c]; mov [index],eax */
+#define RES_SCALE_LEN   14u
+#define RES_RESUME_RVA  0x386854u
+#define RES_FAKE_RVA    0x3865e8u  /* mov rax,[r12+0x1bc]; mov [video],rax */
+#define RES_FAKE_LEN    15u
+#define RES_FAKE_RESUME 0x3865f7u
+#define RES_SNAP_RVA    0x62512eu  /* je: keep the snapped size */
+#define RES_SNAP_LEN    2u
+#define RES_FAKE_CAVE   0x754bf00u /* zero-filled tail of the code mapping */
+#define RES_SCALE_CAVE  0x754bf80u
+#define RES_TAIL_RVA    0x7548000u /* 0x7948000..0x794c000 must be all zero */
+#define RES_TAIL_LEN    0x4000u
+#define RES_CAVE_ROOM   128u
+#define RES_INDEX_RVA   0x83ec408u /* the scale index the size function reads */
+#define RES_VIDEO_RVA   0x91affa8u /* video mode: W, H (from the node) */
+#define RES_SIZES_RVA   0x83ec40cu /* base W,H; scaled W,H; final W,H */
+
+/* 64 bytes of the clean 1.32 eboot around each site (site at +32) */
+static const uint8_t RES_SCALE_CTX[64] = {
+    0xe8,0xf5,0x19,0x06,0x01,0x41,0x83,0xbc,0x24,0xa4,0x01,0x00,0x00,0x00,0x8b,0x15,
+    0x4e,0x4e,0x0c,0x08,0xbe,0x01,0x00,0x00,0x00,0x0f,0x94,0x05,0x5a,0xcf,0x3a,0x09,
+    0x41,0x8b,0x84,0x24,0x3c,0x01,0x00,0x00,0x89,0x05,0xb4,0x5b,0x06,0x08,0x41,0x8b,
+    0x84,0x24,0xd4,0x01,0x00,0x00,0x89,0x05,0x6e,0x97,0xe2,0x08,0xb8,0x03,0x00,0x00
+};
+static const uint8_t RES_FAKE_CTX[64] = {
+    0xab,0xe3,0x08,0xff,0x90,0x18,0x01,0x00,0x00,0x84,0xc0,0x74,0x13,0x48,0x8b,0x05,
+    0x04,0xab,0xe3,0x08,0x48,0x8d,0x3d,0xfd,0xaa,0xe3,0x08,0x31,0xf6,0xff,0x50,0x48,
+    0x49,0x8b,0x84,0x24,0xbc,0x01,0x00,0x00,0x48,0x89,0x05,0xb1,0x99,0xe2,0x08,0xe8,
+    0xd4,0xb2,0xff,0xff,0xc5,0xfa,0x11,0x85,0xc0,0xfe,0xff,0xff,0xe8,0x27,0xb7,0xff
+};
+static const uint8_t RES_SNAP_CTX[64] = {
+    0x98,0x4c,0x01,0x00,0x00,0x48,0x8d,0xb5,0x50,0xff,0xff,0xff,0x48,0x8d,0x84,0x08,
+    0x50,0x01,0x00,0x00,0x48,0x0f,0x47,0xf8,0xe8,0x35,0x3f,0xe3,0x04,0x48,0x85,0xc0,
+    0x74,0x19,0xc5,0xfa,0x6f,0x00,0xc5,0xf9,0x7e,0xc1,0xc4,0xe3,0x79,0x16,0xc0,0x01,
+    0xc4,0xc1,0x7a,0x7f,0x86,0x94,0x00,0x00,0x00,0xeb,0x0e,0x41,0x8b,0x8e,0x94,0x00
+};
+static const uint8_t RES_SNAP_NEW[2] = {0xeb, 0x19}; /* je -> jmp */
+
+/* the game's ratio tables (0x7220660/0x72206a0), indexed by (index - 1);
+ * only ratios up to 1 (1..10) fit the 4K checkerboard buffers */
+#define RES_MAX_INDEX 10
+static const char *const RATIO_NAME[RES_MAX_INDEX + 1] = {
+    "stock", "1/2", "2/3", "3/4", "4/5", "5/6", "7/8", "9/10", "11/12",
+    "14/15", "29/30"};
+static const uint32_t RATIO_NUM[RES_MAX_INDEX] = {1, 2, 3, 4, 5, 7, 9, 11, 14, 29};
+static const uint32_t RATIO_DEN[RES_MAX_INDEX] = {2, 3, 4, 5, 6, 8, 10, 12, 15, 30};
+
 /* overridable only for the host-side tests in test/ */
 #ifndef LOG_DIR
 #define LOG_DIR  "/data/rdr2-60fps"
 #endif
 #define LOG_PATH LOG_DIR "/rdr2-60fps.log"
+#define CONF_PATH LOG_DIR "/scale.txt"
 
 /* where the system keeps each installed title's param.sfo */
 #ifndef APPMETA_DIR
@@ -82,13 +148,20 @@ static const uint8_t PATCH_NEW[PATCH_LEN]  = {0x31, 0xf6, 0x90}; /* xor esi,esi;
 #endif
 #define LOCK_PORT 47960 /* loopback UDP port held as a single-instance lock */
 
-#define POLL_USEC       500000u /* foreground poll, as in the tested original */
-#define WAIT_POLLS      1200    /* x 0.5 s = 10 min */
+#define POLL_USEC       20000u  /* fast: the resolution patch must beat startup */
+#define WAIT_POLLS      30000   /* x 20 ms = 10 min */
 #define LIST_TRIES      5       /* process list failures in a row */
 #define RESOLVE_TRIES   10      /* x 0.3 s: game memory not ready yet */
 #define RESOLVE_USEC    300000u
 #define WRITE_TRIES     3
 #define WRITE_USEC      200000u
+#define RES_RESOLVE_TRIES 300   /* x 10 ms */
+#define RES_RESOLVE_USEC  10000u
+#define RES_WRITE_USEC    20000u
+#ifndef RES_SIZES_POLLS
+#define RES_SIZES_POLLS 120     /* x 0.25 s = 30 s for the game to size its render */
+#endif
+#define RES_SIZES_USEC  250000u
 
 enum {
     EXIT_OK = 0,
@@ -480,14 +553,395 @@ static int wait_for_game(struct fg_info *fg, int *already_open) {
             notify("%s is not RDR2, still waiting", fg->titleid);
         }
         last_pid = fg->pid;
-        if (poll && poll % 60 == 0)
-            logmsg("INFO", "still waiting for RDR2 (%u s)", poll / 2);
+        if (poll && poll % 1500 == 0)
+            logmsg("INFO", "still waiting for RDR2 (%u s)", poll / 50);
         usleep(POLL_USEC);
     }
     return 1;
 }
 
+/* ------------------------------------------------------------ resolution */
+
+static int g_fake4k = 1;     /* game believes the TV is 4K (1080p TVs) */
+static int g_scale_2160 = 0; /* PC Resolution Scale index for 4K */
+
+/* Reads "fake4k=" and "2160p=" lines; writes the defaults if the file
+ * doesn't exist yet, so there's something to edit over FTP. */
+static void load_settings(void) {
+    char line[128];
+    FILE *f = fopen(CONF_PATH, "r");
+    if (!f) {
+        f = fopen(CONF_PATH, "w");
+        if (f) {
+            fprintf(f, "# RDR2 resolution. fake4k=1: on a 1080p TV, use the game's own\n"
+                       "# 4K checkerboard (1920x2160 -> 3840x2160, shown at 1080p).\n"
+                       "# 2160p: 0 = stock, or a lighter render for more fps headroom:\n"
+                       "#  3 = 3/4 (2880x1620), 2 = 2/3 (2560x1440), 1 = 1/2 (1920x1080)\n"
+                       "fake4k=1\n2160p=0\n");
+            fclose(f);
+            logmsg("INFO", "wrote default settings to %s", CONF_PATH);
+        }
+        return;
+    }
+    while (fgets(line, sizeof(line), f)) {
+        char *eq = strchr(line, '=');
+        int v;
+        if (line[0] == '#' || !eq)
+            continue;
+        v = atoi(eq + 1);
+        if (!strncmp(line, "fake4k", 6)) {
+            g_fake4k = v != 0;
+        } else if (!strncmp(line, "2160p", 5)) {
+            if (v < 0 || v > RES_MAX_INDEX)
+                logmsg("WARN", "ignoring 2160p=%d (must be 0..%d: ratios above 1 "
+                       "corrupt the image)", v, RES_MAX_INDEX);
+            else
+                g_scale_2160 = v;
+        }
+    }
+    fclose(f);
+}
+
+static void put32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static int all_zero(const uint8_t *p, uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; i++)
+        if (p[i])
+            return 0;
+    return 1;
+}
+
+static void hexstr(const uint8_t *p, uint32_t n, char *out, size_t outlen) {
+    uint32_t i;
+    out[0] = 0;
+    for (i = 0; i < n && (i + 1) * 3 < outlen; i++)
+        snprintf(out + i * 3, outlen - i * 3, "%02x%s", p[i], i + 1 < n ? " " : "");
+}
+
+/* mov dword [r12 + disp32], imm32 */
+static uint32_t emit_r12_set(uint8_t *out, uint32_t n, uint32_t disp, uint32_t v) {
+    out[n++] = 0x41;
+    out[n++] = 0xc7;
+    out[n++] = 0x84;
+    out[n++] = 0x24;
+    put32le(out + n, disp);
+    put32le(out + n + 4, v);
+    return n + 8;
+}
+
+/* The fake-4K cave, from the apply step's copy of the node's screen size
+ * (r12 = the live settings node):
+ *   cmp dword [r12+0x1c0], 1080; jne copy
+ *   mov dword [r12+0x1bc], 3840; mov dword [r12+0x1c0], 2160
+ *   mov byte [r12+0xe9], 1                         ; checkerboard on
+ *   copy: mov rax, [r12+0x1bc]; mov [rip -> video mode], rax   ; the original
+ *   jmp resume
+ * Returns its length (67). */
+static uint32_t build_fake_cave(uint64_t base, uint8_t out[RES_CAVE_ROOM]) {
+    static const uint8_t cmp[8] = {0x41, 0x81, 0xbc, 0x24, 0xc0, 0x01, 0x00, 0x00};
+    static const uint8_t cb[9] = {0x41, 0xc6, 0x84, 0x24, 0xe9, 0x00, 0x00, 0x00, 0x01};
+    static const uint8_t ld[8] = {0x49, 0x8b, 0x84, 0x24, 0xbc, 0x01, 0x00, 0x00};
+    uint64_t cave = base + RES_FAKE_CAVE;
+    uint32_t n, jne_at;
+    memcpy(out, cmp, sizeof(cmp)); /* cmp dword [r12 + 0x1c0], 1080 */
+    put32le(out + 8, 1080);
+    n = 12;
+    out[n++] = 0x75; /* jne copy */
+    jne_at = n++;
+    n = emit_r12_set(out, n, 0x1bc, 3840);
+    n = emit_r12_set(out, n, 0x1c0, 2160);
+    memcpy(out + n, cb, sizeof(cb));
+    n += sizeof(cb);
+    out[jne_at] = (uint8_t)(n - (jne_at + 1));
+    memcpy(out + n, ld, sizeof(ld)); /* mov rax, [r12 + 0x1bc] */
+    n += 8;
+    out[n++] = 0x48; /* mov [rip + d], rax */
+    out[n++] = 0x89;
+    out[n++] = 0x05;
+    put32le(out + n, (uint32_t)(int32_t)((base + RES_VIDEO_RVA) - (cave + n + 4)));
+    n += 4;
+    out[n++] = 0xe9; /* jmp resume */
+    put32le(out + n, (uint32_t)(int32_t)((base + RES_FAKE_RESUME) - (cave + n + 4)));
+    n += 4;
+    return n;
+}
+
+/* The scale cave, from the apply step's copy of scalingMode (r12 = the node,
+ * whose screen height is 2160 by then on a 4K or faked-4K TV):
+ *   cmp dword [r12+0x1c0], 2159; jbe done
+ *   mov dword [r12+0x13c], <2160p setting>
+ *   done: mov eax, [r12+0x13c]; mov [rip -> index], eax   ; the original
+ *   jmp resume
+ * Returns its length (43). */
+static uint32_t build_scale_cave(uint64_t base, uint8_t out[RES_CAVE_ROOM]) {
+    static const uint8_t cmp[8] = {0x41, 0x81, 0xbc, 0x24, 0xc0, 0x01, 0x00, 0x00};
+    static const uint8_t ld[8] = {0x41, 0x8b, 0x84, 0x24, 0x3c, 0x01, 0x00, 0x00};
+    uint64_t cave = base + RES_SCALE_CAVE;
+    uint32_t n, jbe_at;
+    memcpy(out, cmp, sizeof(cmp)); /* cmp dword [r12 + 0x1c0], 2159 */
+    put32le(out + 8, 2159);
+    n = 12;
+    out[n++] = 0x76; /* jbe done */
+    jbe_at = n++;
+    n = emit_r12_set(out, n, 0x13c, (uint32_t)g_scale_2160);
+    out[jbe_at] = (uint8_t)(n - (jbe_at + 1));
+    memcpy(out + n, ld, sizeof(ld)); /* mov eax, [r12 + 0x13c] */
+    n += 8;
+    out[n++] = 0x89; /* mov [rip + d], eax */
+    out[n++] = 0x05;
+    put32le(out + n, (uint32_t)(int32_t)((base + RES_INDEX_RVA) - (cave + n + 4)));
+    n += 4;
+    out[n++] = 0xe9; /* jmp resume */
+    put32le(out + n, (uint32_t)(int32_t)((base + RES_RESUME_RVA) - (cave + n + 4)));
+    n += 4;
+    return n;
+}
+
+/* jmp <cave>; nop x (len - 5) */
+static void build_jmp(uint64_t site, uint64_t cave, uint8_t *out, uint32_t len) {
+    out[0] = 0xe9;
+    put32le(out + 1, (uint32_t)(int32_t)(cave - (site + 5)));
+    memset(out + 5, 0x90, len - 5);
+}
+
+/* One place the resolution patch changes: 64 bytes of clean code around it
+ * (site at +32) and what goes there when it's on. */
+struct res_site {
+    const char *name;
+    uint32_t rva, len;
+    const uint8_t *ctx;
+    int on;
+    uint8_t want[16];
+    uint8_t cur[64];
+};
+
+enum { RS_SNAP, RS_FAKE, RS_SCALE, RS_COUNT }; /* also the write order */
+
+static void res_sites(struct res_site s[RS_COUNT], uint64_t base) {
+    memset(s, 0, sizeof(struct res_site) * RS_COUNT);
+    s[RS_SNAP] = (struct res_site){"mode snap", RES_SNAP_RVA, RES_SNAP_LEN,
+                                   RES_SNAP_CTX, g_fake4k, {0}, {0}};
+    memcpy(s[RS_SNAP].want, RES_SNAP_NEW, RES_SNAP_LEN);
+    s[RS_FAKE] = (struct res_site){"fake 4K", RES_FAKE_RVA, RES_FAKE_LEN,
+                                   RES_FAKE_CTX, g_fake4k, {0}, {0}};
+    build_jmp(base + RES_FAKE_RVA, base + RES_FAKE_CAVE, s[RS_FAKE].want,
+              RES_FAKE_LEN);
+    s[RS_SCALE] = (struct res_site){"scale", RES_SCALE_RVA, RES_SCALE_LEN,
+                                    RES_SCALE_CTX, g_scale_2160 != 0, {0}, {0}};
+    build_jmp(base + RES_SCALE_RVA, base + RES_SCALE_CAVE, s[RS_SCALE].want,
+              RES_SCALE_LEN);
+}
+
+/* the 64 bytes match the clean code, ignoring the site */
+static int res_ctx_ok(const struct res_site *s) {
+    return !memcmp(s->cur, s->ctx, CTX_OFF) &&
+           !memcmp(s->cur + CTX_OFF + s->len, s->ctx + CTX_OFF + s->len,
+                   64 - CTX_OFF - s->len);
+}
+
+/* write -> read back, a few tries */
+static int res_write(uint32_t pid, uint64_t addr, const uint8_t *data,
+                     uint32_t len, const char *what) {
+    uint8_t cur[RES_CAVE_ROOM];
+    unsigned t;
+    for (t = 1; t <= WRITE_TRIES; t++) {
+        if (proc_write(pid, addr, data, len))
+            logmsg("WARN", "%s: write try %u/%u rejected", what, t, WRITE_TRIES);
+        else if (proc_read(pid, addr, cur, len))
+            logmsg("WARN", "%s: read-back try %u/%u failed", what, t, WRITE_TRIES);
+        else if (!memcmp(cur, data, len))
+            return 0;
+        else
+            logmsg("WARN", "%s: read back different bytes (try %u)", what, t);
+        usleep(RES_WRITE_USEC);
+    }
+    return -1;
+}
+
+static int read_sizes(uint32_t pid, uint64_t base, uint32_t sz[6]) {
+    uint8_t b[24];
+    unsigned i;
+    if (proc_read(pid, base + RES_SIZES_RVA, b, sizeof(b)))
+        return -1;
+    for (i = 0; i < 6; i++)
+        sz[i] = get32le(b + i * 4);
+    return 0;
+}
+
+/* the eboot's load address, recognised by the scale site's context; retries
+ * briefly while the game is being mapped */
+static int res_base(uint32_t pid, uint64_t *base) {
+    uint8_t cur[64];
+    uint64_t b;
+    unsigned t;
+    for (t = 0; t < RES_RESOLVE_TRIES; t++) {
+        b = IMG_BASE_DEFAULT;
+        if (!proc_read(pid, b + RES_SCALE_RVA - CTX_OFF, cur, 64) &&
+            !memcmp(cur, RES_SCALE_CTX, CTX_OFF)) {
+            *base = b;
+            return 0;
+        }
+        if (!eboot_base(pid, &b) && b != IMG_BASE_DEFAULT &&
+            !proc_read(pid, b + RES_SCALE_RVA - CTX_OFF, cur, 64) &&
+            !memcmp(cur, RES_SCALE_CTX, CTX_OFF)) {
+            *base = b;
+            return 0;
+        }
+        usleep(RES_RESOLVE_USEC);
+    }
+    return -1;
+}
+
+enum res { RES_OFF, RES_PATCHED, RES_ALREADY, RES_SKIPPED };
+static enum res g_res = RES_OFF;
+
+/* Patches the resolution, or explains in a notification why it didn't.
+ * Never touches the game unless every site and the caves check out. */
+static enum res res_patch(uint32_t pid, uint64_t *base_out) {
+    static uint8_t tail[RES_TAIL_LEN];
+    struct res_site st[RS_COUNT];
+    uint8_t fcave[RES_CAVE_ROOM], scave[RES_CAVE_ROOM];
+    char hex[RES_CAVE_ROOM * 3 + 1];
+    uint32_t flen = 0, slen = 0, sz[6], video;
+    uint64_t base;
+    unsigned i;
+    int all_ours = 1, all_clean = 1;
+
+    if (res_base(pid, &base)) {
+        notify("resolution: game code not found, 60fps only.");
+        return RES_SKIPPED;
+    }
+    *base_out = base;
+    res_sites(st, base);
+    if (st[RS_FAKE].on)
+        flen = build_fake_cave(base, fcave);
+    if (st[RS_SCALE].on)
+        slen = build_scale_cave(base, scave);
+    if (proc_read(pid, base + RES_TAIL_RVA, tail, RES_TAIL_LEN)) {
+        notify("resolution: couldn't read the game code, 60fps only.");
+        return RES_SKIPPED;
+    }
+    for (i = 0; i < RS_COUNT; i++) {
+        struct res_site *s = &st[i];
+        int clean, ours;
+        if (proc_read(pid, base + s->rva - CTX_OFF, s->cur, 64) || !res_ctx_ok(s)) {
+            notify("resolution: game code doesn't match v1.32 (%s), 60fps only.",
+                   s->name);
+            return RES_SKIPPED;
+        }
+        clean = !memcmp(s->cur + CTX_OFF, s->ctx + CTX_OFF, s->len);
+        ours = !memcmp(s->cur + CTX_OFF, s->want, s->len);
+        if (!clean && !ours) {
+            hexstr(s->cur + CTX_OFF, s->len, hex, sizeof(hex));
+            logmsg("WARN", "%s site: %s", s->name, hex);
+            notify("resolution: unexpected code (%s), 60fps only.", s->name);
+            return RES_SKIPPED;
+        }
+        all_clean &= clean;
+        if (s->on ? !ours : !clean)
+            all_ours = 0;
+    }
+    if (flen && memcmp(tail + (RES_FAKE_CAVE - RES_TAIL_RVA), fcave, flen))
+        all_ours = 0;
+    if (slen && memcmp(tail + (RES_SCALE_CAVE - RES_TAIL_RVA), scave, slen))
+        all_ours = 0;
+    if (!all_clean) {
+        if (all_ours)
+            return RES_ALREADY;
+        notify("resolution: patched with other settings. Restart RDR2 for them; "
+               "60fps only.");
+        return RES_SKIPPED;
+    }
+    if (!all_zero(tail, RES_TAIL_LEN)) {
+        notify("resolution: the end of the game code isn't empty, 60fps only.");
+        return RES_SKIPPED;
+    }
+    /* too late? the apply step writes the video mode, the size function the
+     * sizes; after either, the game has its resolution */
+    if (read_sizes(pid, base, sz) || proc_read(pid, base + RES_VIDEO_RVA,
+                                               (uint8_t *)&video, 4) ||
+        !all_zero((const uint8_t *)sz, sizeof(sz)) || video) {
+        notify("resolution: RDR2 already set it. Load this before starting "
+               "RDR2 for 4K; 60fps only.");
+        return RES_SKIPPED;
+    }
+
+    /* caves first, then the snap, then the jumps that reach the caves */
+    if (flen) {
+        hexstr(fcave, flen, hex, sizeof(hex));
+        logmsg("INFO", "fake 4K cave %u bytes at 0x%llx: %s", flen,
+               (unsigned long long)(base + RES_FAKE_CAVE), hex);
+        if (res_write(pid, base + RES_FAKE_CAVE, fcave, flen, "fake 4K cave")) {
+            notify("resolution: write failed, 60fps only.");
+            return RES_SKIPPED;
+        }
+    }
+    if (slen) {
+        hexstr(scave, slen, hex, sizeof(hex));
+        logmsg("INFO", "scale cave %u bytes at 0x%llx: %s", slen,
+               (unsigned long long)(base + RES_SCALE_CAVE), hex);
+        if (res_write(pid, base + RES_SCALE_CAVE, scave, slen, "scale cave")) {
+            notify("resolution: write failed, 60fps only.");
+            return RES_SKIPPED;
+        }
+    }
+    for (i = 0; i < RS_COUNT; i++) {
+        struct res_site *s = &st[i];
+        if (!s->on)
+            continue;
+        if (res_write(pid, base + s->rva, s->want, s->len, s->name)) {
+            notify("resolution: write failed (%s). Restart RDR2 before playing.",
+                   s->name);
+            return RES_SKIPPED;
+        }
+        hexstr(s->want, s->len, hex, sizeof(hex));
+        logmsg("OK", "%s at 0x%llx: %s", s->name,
+               (unsigned long long)(base + s->rva), hex);
+    }
+    return RES_PATCHED;
+}
+
+/* Waits for the game to size its render and describes it in `line` (for
+ * the final notification); "" if it couldn't be seen or didn't match. */
+static void res_report(uint32_t pid, uint64_t base, char *line, size_t len) {
+    uint32_t sz[6] = {0}, idx, ew, eh;
+    unsigned i;
+    line[0] = 0;
+    for (i = 0; i < RES_SIZES_POLLS; i++) {
+        if (!read_sizes(pid, base, sz) && sz[5])
+            break;
+        usleep(RES_SIZES_USEC);
+    }
+    if (i == RES_SIZES_POLLS) {
+        logmsg("WARN", "the game didn't size its render within %u s",
+               RES_SIZES_POLLS * (RES_SIZES_USEC / 1000u) / 1000u);
+        return;
+    }
+    usleep(RES_SIZES_USEC); /* the checkerboard width doubling comes last */
+    read_sizes(pid, base, sz);
+    logmsg("OK", "base %ux%u, scaled %ux%u, final %ux%u", sz[0], sz[1], sz[2],
+           sz[3], sz[4], sz[5]);
+    idx = sz[1] > 2159 ? (uint32_t)g_scale_2160 : 0;
+    ew = idx ? sz[0] * RATIO_NUM[idx - 1] / RATIO_DEN[idx - 1] : sz[0];
+    eh = idx ? sz[1] * RATIO_NUM[idx - 1] / RATIO_DEN[idx - 1] : sz[1];
+    if (sz[2] != ew || sz[3] != eh || (g_fake4k && sz[1] == 1080)) {
+        logmsg("WARN", "expected %s on a 4K or faked-4K TV", RATIO_NAME[idx]);
+        notify("resolution didn't take effect (rendering %ux%u).", sz[2], sz[3]);
+        return;
+    }
+    snprintf(line, len, "Resolution: %ux%u%s, %ux%u frame", sz[2], sz[3],
+             sz[4] != sz[0] ? " checkerboard" : "", sz[4], sz[5]);
+}
+
 static int finish(int code) {
+    if (code != EXIT_OK && g_res == RES_PATCHED)
+        notify("the resolution patch is on; restart RDR2 to undo it.");
     logmsg("INFO", "exit code %d", code);
     if (g_lock >= 0)
         close(g_lock);
@@ -499,7 +953,9 @@ static int finish(int code) {
 int main(void) {
     struct fg_info fg;
     uint8_t ctx[64];
-    uint64_t target;
+    uint64_t target, res_base_addr = 0;
+    enum res res = RES_OFF;
+    char res_line[96] = "";
     unsigned tries;
     unsigned long found_ms;
     int already_open = 0, mismatch, rc;
@@ -525,6 +981,9 @@ int main(void) {
 
     logmsg("INFO", "console firmware %x.%02x", kernel_get_fw_version() >> 24,
            (kernel_get_fw_version() >> 16) & 0xff);
+    load_settings();
+    logmsg("INFO", "resolution settings: fake 4K %s, 4K scale %s (%d)",
+           g_fake4k ? "on" : "off", RATIO_NAME[g_scale_2160], g_scale_2160);
 
     /* 1) wait for the game */
     notify("ready. Start Red Dead Redemption 2 (waiting up to 10 min)");
@@ -551,7 +1010,20 @@ int main(void) {
     }
     notify("found %s v%s, patching...", fg.titleid, fg.app_ver);
 
-    /* 3) locate and verify the patch site */
+    /* 3) resolution first: it has to land before the game applies its
+     * settings; whatever happens here, the 60fps patch still follows */
+    if (g_fake4k || g_scale_2160) {
+        if (already_open)
+            notify("resolution: RDR2 was already open, it's set at startup. "
+                   "Load this before starting RDR2 for 4K; 60fps only.");
+        else
+            g_res = res = res_patch(fg.pid, &res_base_addr);
+        if (res == RES_PATCHED)
+            logmsg("OK", "resolution patched %lu ms after the game was found",
+                   elapsed_ms() - found_ms);
+    }
+
+    /* 4) locate and verify the 60fps patch site */
     if (resolve_target(fg.pid, &target, ctx, &tries, &mismatch)) {
         if (mismatch)
             notify("game code doesn't match the 1.32 patch. Nothing changed.");
@@ -570,7 +1042,7 @@ int main(void) {
         return finish(EXIT_UNEXPECTED);
     }
 
-    /* 4) write + read back */
+    /* 5) write + read back */
     rc = apply_patch(fg.pid, target, &tries);
     if (rc == -2) {
         notify("bytes changed under us. Nothing changed.");
@@ -582,10 +1054,15 @@ int main(void) {
     }
     logmsg("OK", "patched %lu ms after the game was found",
            elapsed_ms() - found_ms);
+
+    /* 6) what resolution the game picked */
+    if (res == RES_PATCHED || res == RES_ALREADY)
+        res_report(fg.pid, res_base_addr, res_line, sizeof(res_line));
     if (already_open)
         notify("applied, but RDR2 was already open. If it stays at 30fps: "
                "close the game, load this payload again, then start RDR2.");
     else
-        notify_plain("60FPS IS ON, Enjoy.\nMade by Arman with \u2764\ufe0f");
+        notify_plain("60FPS IS ON, Enjoy.\n%s%sMade by Arman with \u2764\ufe0f",
+                     res_line, res_line[0] ? "\n" : "");
     return finish(EXIT_OK);
 }

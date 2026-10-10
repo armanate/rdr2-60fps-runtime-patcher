@@ -1,7 +1,7 @@
 # Build the PS5 payload (ps5-payload-sdk)
 #   export PS5_PAYLOAD_SDK=/opt/ps5-payload-sdk
 #   make             -> "RedDead2 60FPS_v<version>.elf"
-#   make send PS5_HOST=192.168.x.x   -> push it to elfldr (port 9021)
+#   make send PS5_HOST=192.168.x.x       -> push the RDR2 one to elfldr (port 9021)
 PS5_HOST ?= ps5
 PS5_PORT ?= 9021
 
@@ -21,15 +21,16 @@ TOOL_VERSION := $(shell sed -n 's/^\#define TOOL_VERSION "\(.*\)"/\1/p' rdr2-60f
 ELF := RedDead2 60FPS_v$(TOOL_VERSION).elf
 
 CFLAGS := -Wall -Wextra -Werror -Os
-SRCS := rdr2-60fps.c ptwalk.c
 
-all:
-	$(CC) $(CFLAGS) -o "$(ELF)" $(SRCS)
+all: rdr2
 
-send: all
+rdr2:
+	$(CC) $(CFLAGS) -o "$(ELF)" rdr2-60fps.c ptwalk.c
+
+send: rdr2
 	$(PS5_DEPLOY) -h $(PS5_HOST) -p $(PS5_PORT) "$(ELF)"
 
 clean:
 	rm -f "$(ELF)" rdr2-60fps.elf
 
-.PHONY: all send clean
+.PHONY: all rdr2 send clean

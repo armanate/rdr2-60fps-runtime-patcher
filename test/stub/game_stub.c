@@ -5,7 +5,11 @@
  *                                sceKernelGetAppInfo fills them)
  *   'R' u32 pid u64 addr u32 n -> u32 status, then n bytes if status == 0
  *   'W' u32 pid u64 addr u32 n, n bytes -> u32 status
- *   'B' u32 pid               -> u64 eboot base (0 = unknown) */
+ *   'B' u32 pid               -> u64 eboot base (0 = unknown)
+ *   'H' u32 pid u64 0 u32 n, name -> u32 status, u32 handle
+ *   'S' u32 pid u64 handle u32 n, name -> u64 address (0 = not found)
+ *   'M' u32 pid               -> u32 count (0xffffffff = map refused), then
+ *                                count x (u64 start, u64 end, u32 prot) */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -92,9 +96,62 @@ int mdbg_copyin(pid_t pid, const void *buf, intptr_t addr, size_t len) {
 }
 
 int kernel_dynlib_handle(pid_t pid, const char *basename, uint32_t *handle) {
-    (void)pid;
+    uint8_t b[17];
+    uint32_t r[2];
     *handle = 0;
-    return strcmp(basename, "eboot.bin") ? -1 : 0;
+    if (!strcmp(basename, "eboot.bin"))
+        return 0;
+    pack(b, 'H', (uint32_t)pid, 0, (uint32_t)strlen(basename));
+    if (xfer(b, sizeof(b), basename, strlen(basename), r, sizeof(r), NULL) || r[0])
+        return -1;
+    *handle = r[1];
+    return 0;
+}
+
+intptr_t kernel_dynlib_dlsym(pid_t pid, uint32_t handle, const char *sym) {
+    uint8_t b[17];
+    uint64_t addr;
+    pack(b, 'S', (uint32_t)pid, handle, (uint32_t)strlen(sym));
+    if (xfer(b, sizeof(b), sym, strlen(sym), &addr, 8, NULL))
+        return 0;
+    return (intptr_t)addr;
+}
+
+/* a memory map entry, as the test console reports it */
+struct region {
+    uint64_t start, end;
+    int prot;
+};
+
+int get_vmmap(uint32_t pid, struct region *r, int max) {
+    uint8_t b[17], e[20];
+    uint32_t n, i;
+    size_t got;
+    int fd;
+    pack(b, 'M', pid, 0, 0);
+    if (xfer(b, sizeof(b), NULL, 0, &n, 4, &fd))
+        return -1;
+    if (n == 0xffffffffu) {
+        close(fd);
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        for (got = 0; got < sizeof(e);) {
+            ssize_t k = recv(fd, e + got, sizeof(e) - got, 0);
+            if (k <= 0) {
+                close(fd);
+                return -1;
+            }
+            got += (size_t)k;
+        }
+        if ((int)i < max) {
+            memcpy(&r[i].start, e, 8);
+            memcpy(&r[i].end, e + 8, 8);
+            memcpy(&r[i].prot, e + 16, 4);
+        }
+    }
+    close(fd);
+    return (int)n < max ? (int)n : max;
 }
 
 intptr_t kernel_dynlib_mapbase_addr(pid_t pid, uint32_t handle) {

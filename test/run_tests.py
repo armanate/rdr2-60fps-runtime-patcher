@@ -196,6 +196,10 @@ def scenario(title):
 def main():
     tmp = tempfile.mkdtemp(prefix="rdr2-60fps-test-")
     exe = build(tmp)
+    # these checks cover the 60fps patch alone; run_tests_combined.py covers
+    # the resolution part
+    with open(os.path.join(tmp, "scale.txt"), "w") as f:
+        f.write("fake4k=0\n2160p=0\n")
 
     scenario("CUSA08519 v01.32 starts after the payload")
     d = FakeConsole(tmp, [NO_GAME, NO_GAME, RDR2_EU])

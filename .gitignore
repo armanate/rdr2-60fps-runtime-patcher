@@ -12,3 +12,17 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+# game dumps from rdr2-dump (your own copy of the game's code: never commit)
+dumps/
+rdr2-dump/
+rdr2-heapscan/
+eboot_mem.bin
+
+# research tools (local only): resolution scale, eboot dump, heap scan
+src/rdr2-resscale.c
+test/run_tests_resscale.py
+src/rdr2-dump.c
+test/run_tests_dump.py
+src/rdr2-heapscan.c
+test/run_tests_heapscan.py

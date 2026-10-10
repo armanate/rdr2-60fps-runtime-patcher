@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Host-side tests for rdr2-60fps.c.
 
-Builds the payload for this machine (clang) with stubbed notifications, runs it
-against a fake ps5debug-NG server, and checks what it wrote, what it showed
-and how it exited. No PS5 needed; this checks the logic, not the hardware.
+Builds the payload for this machine (clang) with the PS5 calls stubbed
+(test/stub), runs it against a fake console that holds the game's memory and
+param.sfo, and checks what it wrote, what it showed and how it exited. No PS5 needed; this checks the logic, not the hardware.
 
     python3 test/run_tests.py
 """
@@ -18,7 +18,6 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT = 17440
-SUCCESS, ERROR = 0x80000000, 0xF0000001
 
 RVA = 0x5453029
 CTX = bytes.fromhex(
@@ -30,12 +29,42 @@ ORIG, NEW = bytes.fromhex("0f44f0"), bytes.fromhex("31f690")
 NO_GAME = (0, "", "")
 
 
-class FakeDebugger:
-    """Just enough of the ps5debug-NG protocol for the payload."""
+def make_sfo(entries):
+    """Minimal param.sfo with UTF-8 string values."""
+    keys = b"".join(k.encode() + b"\0" for k, _ in entries)
+    keys += b"\0" * (-len(keys) % 4)
+    index, data, koff = b"", b"", 0
+    for k, v in entries:
+        val = v.encode() + b"\0"
+        size = len(val) + (-len(val) % 4)
+        index += struct.pack("<HHIII", koff, 0x0204, len(val), size, len(data))
+        data += val.ljust(size, b"\0")
+        koff += len(k) + 1
+    key_start = 20 + len(index)
+    return (b"\0PSF" + struct.pack("<IIII", 0x101, key_start,
+                                     key_start + len(keys), len(entries))
+            + index + keys + data)
 
-    def __init__(self, fg_seq, base=0x400000, ctx=CTX, fail_reads=0,
-                 reject_writes=False):
+
+def app_info(tid, title_off):
+    """Raw sceKernelGetAppInfo bytes: app id, then junk, then the title id."""
+    if not tid:
+        return bytes(0x100)
+    b = bytearray(0x100)
+    b[0:4] = struct.pack("<I", 0x60000123)
+    b[4:title_off] = bytes(range(1, title_off - 3))  # no capitals/digits run
+    b[title_off:title_off + len(tid)] = tid.encode()
+    b[0x40:0x50] = b"CUSA00000-APP000"[:16]  # a decoy after the real id
+    return bytes(b)
+
+
+class FakeConsole:
+    """The PS5 side of test/stub/game_stub.c: running game, memory, param.sfo."""
+
+    def __init__(self, tmp, fg_seq, base=0x400000, ctx=CTX, fail_reads=0,
+                 reject_writes=False, title_off=0x10):
         self.fg_seq = list(fg_seq)
+        self.title_off = title_off
         self.base = base
         self.target = base + RVA
         self.mem_start = self.target - 0x80
@@ -44,10 +73,23 @@ class FakeDebugger:
         self.fail_reads = fail_reads
         self.reject_writes = reject_writes
         self.writes = []
+        for _, tid, ver in self.fg_seq:
+            if not tid:
+                continue
+            d = os.path.join(tmp, "appmeta", tid)
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "param.sfo")
+            if ver is None:
+                if os.path.exists(path):
+                    os.remove(path)
+                continue
+            with open(path, "wb") as f:
+                f.write(make_sfo([("APP_VER", ver), ("TITLE_ID", tid),
+                                  ("VERSION", "01.00")]))
         self.srv = socket.socket()
         self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.srv.bind(("127.0.0.1", PORT))
-        self.srv.listen(4)
+        self.srv.listen(8)
         self.alive = True
         threading.Thread(target=self._accept, daemon=True).start()
 
@@ -85,48 +127,33 @@ class FakeDebugger:
     def _serve(self, c):
         st = lambda v: c.sendall(struct.pack("<I", v))
         try:
-            while True:
-                magic, cmd, ln = struct.unpack("<III", self._recvn(c, 12))
-                assert magic == 0xFFAABBCC
-                body = self._recvn(c, ln) if ln else b""
-                if cmd == 0xBD000001:
-                    c.sendall(struct.pack("<I", 3) + b"1.3")
-                elif cmd == 0xBD000500:
-                    c.sendall(struct.pack("<H", 1360))
-                elif cmd == 0xBDDD0006:
-                    pid, tid, ver = self.fg_seq.pop(0) if len(self.fg_seq) > 1 else self.fg_seq[0]
-                    st(SUCCESS)
-                    c.sendall(struct.pack("<I16s64s40s16s", pid, tid.encode(),
-                                          b"", b"", ver.encode()))
-                elif cmd == 0xBDAA0002:
-                    pid, addr, n = struct.unpack("<IQI", body)
-                    data = self._read(addr, n)
-                    if data is None:
-                        st(ERROR)
-                    else:
-                        st(SUCCESS)
-                        c.sendall(data)
-                elif cmd == 0xBDAA0003:
-                    pid, addr, n = struct.unpack("<IQI", body)
-                    st(SUCCESS)
-                    data = self._recvn(c, n)
-                    if self.reject_writes:
-                        st(ERROR)
-                        continue
-                    off = addr - self.mem_start
-                    self.mem[off:off + n] = data
-                    self.writes.append((addr, data))
-                    st(SUCCESS)
-                elif cmd == 0xBDAA0004:
-                    st(SUCCESS)
-                    entries = [("executable", self.base, self.base + 0x6000000, 5),
-                               ("libc.prx", 0x800000000, 0x800100000, 5)]
-                    c.sendall(struct.pack("<I", len(entries)))
-                    for name, s, e, prot in entries:
-                        c.sendall(struct.pack("<32sQQQH", name.encode(), s, e, 0, prot))
+            op = self._recvn(c, 1)
+            if op == b"F":
+                pid, tid, _ = self.fg_seq.pop(0) if len(self.fg_seq) > 1 else self.fg_seq[0]
+                c.sendall(struct.pack("<I", pid) + app_info(tid, self.title_off))
+                return
+            pid, addr, n = struct.unpack("<IQI", self._recvn(c, 16))
+            if op == b"R":
+                data = self._read(addr, n)
+                if data is None:
+                    st(1)
                 else:
-                    st(ERROR)
+                    st(0)
+                    c.sendall(data)
+            elif op == b"W":
+                data = self._recvn(c, n)
+                if self.reject_writes:
+                    st(1)
+                    return
+                off = addr - self.mem_start
+                self.mem[off:off + n] = data
+                self.writes.append((addr, data))
+                st(0)
+            elif op == b"B":
+                c.sendall(struct.pack("<Q", self.base))
         except (ConnectionError, OSError, struct.error):
+            pass
+        finally:
             c.close()
 
 
@@ -135,9 +162,11 @@ def build(tmp):
     subprocess.run(
         ["clang", "-Wall", "-Wextra", "-Werror", "-O1",
          "-I", os.path.join(ROOT, "test", "stub"),
-         f'-DLOG_DIR="{tmp}"', f"-DDBG_PORT={PORT}",
+         "-DHOST_TEST", f'-DLOG_DIR="{tmp}"', f"-DFAKE_PORT={PORT}",
+         f'-DAPPMETA_DIR="{tmp}/appmeta"',
          os.path.join(ROOT, "src", "rdr2-60fps.c"),
          os.path.join(ROOT, "test", "stub", "notify_stub.c"),
+         os.path.join(ROOT, "test", "stub", "game_stub.c"),
          "-o", exe], check=True)
     return exe
 
@@ -169,16 +198,23 @@ def main():
     exe = build(tmp)
 
     scenario("CUSA08519 v01.32 starts after the payload")
-    d = FakeDebugger([NO_GAME, NO_GAME, RDR2_EU])
+    d = FakeConsole(tmp, [NO_GAME, NO_GAME, RDR2_EU])
     rc, toasts, log = run(exe, tmp, d)
     check("exit 0", rc == 0, rc)
     check("one write of 31 f6 90 at 0x5853029", d.writes == [(0x5853029, NEW)], d.writes)
-    check("'60fps ON' toast", any("60fps ON" in t for t in toasts), toasts)
+    check("'60FPS IS ON' toast, no prefix", any(t.startswith("60FPS IS ON") for t in toasts), toasts)
     check("log has firmware 13.60", "firmware 13.60" in log, log)
+    check("log has version from param.sfo", "v01.32 pid 4242" in log, log)
     print("  toasts:", *toasts, sep="\n    ")
 
+    scenario("title id at the SDK sample's offset (other firmwares)")
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], title_off=0x14)
+    rc, toasts, _ = run(exe, tmp, d)
+    check("exit 0", rc == 0, rc)
+    check("written", d.writes == [(0x5853029, NEW)], d.writes)
+
     scenario("wrong game version (01.29)")
-    d = FakeDebugger([NO_GAME, (4242, "CUSA08519", "01.29")])
+    d = FakeConsole(tmp, [NO_GAME, (4242, "CUSA08519", "01.29")])
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 4", rc == 4, rc)
     check("nothing written", not d.writes, d.writes)
@@ -186,7 +222,7 @@ def main():
 
     scenario("different code around the patch site")
     bad = bytearray(CTX); bad[5] ^= 0xFF
-    d = FakeDebugger([NO_GAME, RDR2_EU], ctx=bytes(bad))
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], ctx=bytes(bad))
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 5", rc == 5, rc)
     check("nothing written", not d.writes, d.writes)
@@ -194,7 +230,7 @@ def main():
 
     scenario("already patched (original tool reported 'not found' here)")
     pre = bytearray(CTX); pre[32:35] = NEW
-    d = FakeDebugger([NO_GAME, RDR2_EU], ctx=bytes(pre))
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], ctx=bytes(pre))
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 0", rc == 0, rc)
     check("nothing written", not d.writes, d.writes)
@@ -202,47 +238,62 @@ def main():
 
     scenario("unexpected target bytes")
     odd = bytearray(CTX); odd[32:35] = b"\xaa\xbb\xcc"
-    d = FakeDebugger([NO_GAME, RDR2_EU], ctx=bytes(odd))
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], ctx=bytes(odd))
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 6", rc == 6, rc)
     check("nothing written", not d.writes, d.writes)
 
     scenario("eboot at a non-default base (memory-map fallback)")
-    d = FakeDebugger([NO_GAME, RDR2_EU], base=0x1000000)
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], base=0x1000000)
     rc, toasts, log = run(exe, tmp, d)
     check("exit 0", rc == 0, rc)
     check("write at base+RVA", d.writes == [(0x1000000 + RVA, NEW)], d.writes)
 
     scenario("game memory not readable for the first reads (still loading)")
-    d = FakeDebugger([NO_GAME, RDR2_EU], fail_reads=3)
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], fail_reads=3)
     rc, toasts, log = run(exe, tmp, d)
     check("exit 0 after retries", rc == 0, rc)
     check("one write", d.writes == [(0x5853029, NEW)], d.writes)
     check("retries logged", "try 1/10" in log, log)
 
     scenario("RDR2 already open when the payload starts")
-    d = FakeDebugger([RDR2_EU])
+    d = FakeConsole(tmp, [RDR2_EU])
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 0", rc == 0, rc)
     check("written", d.writes == [(0x5853029, NEW)], d.writes)
     check("'already open' warning toast", any("already open" in t for t in toasts), toasts)
 
     scenario("another game first, then RDR2")
-    d = FakeDebugger([NO_GAME, (777, "CUSA00001", "01.00"), (777, "CUSA00001", "01.00"), RDR2_EU])
+    d = FakeConsole(tmp, [NO_GAME, (777, "CUSA00001", "01.00"), (777, "CUSA00001", "01.00"), RDR2_EU])
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 0", rc == 0, rc)
     check("one 'not RDR2' toast", sum("not RDR2" in t for t in toasts) == 1, toasts)
     check("only RDR2 pid patched", d.writes == [(0x5853029, NEW)], d.writes)
 
-    scenario("debugger rejects the write")
-    d = FakeDebugger([NO_GAME, RDR2_EU], reject_writes=True)
+    scenario("param.sfo missing: version unknown, byte check decides")
+    d = FakeConsole(tmp, [NO_GAME, (4242, "CUSA08519", None)])
+    rc, toasts, log = run(exe, tmp, d)
+    check("exit 0", rc == 0, rc)
+    check("written", d.writes == [(0x5853029, NEW)], d.writes)
+    check("'version unknown' logged", "version unknown" in log, log)
+
+    scenario("process list unavailable")
+    d = FakeConsole(tmp, [NO_GAME])
+    d.close()
+    p = subprocess.run([exe], capture_output=True, text=True, timeout=30)
+    toasts = [l[6:] for l in p.stdout.splitlines() if l.startswith("TOAST ")]
+    check("exit 8", p.returncode == 8, p.returncode)
+    check("'couldn't list' toast", any("couldn't list running apps" in t for t in toasts), toasts)
+
+    scenario("write rejected")
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU], reject_writes=True)
     rc, toasts, _ = run(exe, tmp, d)
     check("exit 7", rc == 7, rc)
     check("memory unchanged", d.mem[0x80:0x83] == ORIG, d.mem[0x80:0x83].hex())
     check("'write failed' toast", any("write failed after 3 tries" in t for t in toasts), toasts)
 
     scenario("payload loaded twice")
-    d = FakeDebugger([NO_GAME])
+    d = FakeConsole(tmp, [NO_GAME])
     first = subprocess.Popen([exe], stdout=subprocess.PIPE, text=True)
     time.sleep(1.5)
     second = subprocess.run([exe], capture_output=True, text=True, timeout=10)
@@ -254,7 +305,7 @@ def main():
     scenario("log is cleared on every start")
     with open(os.path.join(tmp, "rdr2-60fps.log"), "a") as f:
         f.write("OLD-RUN-MARKER\n")
-    d = FakeDebugger([NO_GAME, RDR2_EU])
+    d = FakeConsole(tmp, [NO_GAME, RDR2_EU])
     rc, _, log = run(exe, tmp, d)
     check("old content gone", "OLD-RUN-MARKER" not in log)
 

@@ -6,29 +6,46 @@
  * PS-Game-Patch database lists for CUSA03041, CUSA08519 and CUSA08568.
  *
  * What this payload does, and nothing else:
- *   - talks to ps5debug-NG on 127.0.0.1:744 (the only way it touches memory),
- *   - asks which app is in front (pid, title id, version),
- *   - writes 3 bytes into the RDR2 process, only after the 61 bytes around
- *     them match the clean 1.32 eboot exactly, then reads them back,
+ *   - finds the running game (eboot.bin) and reads its title id and version,
+ *   - reads its memory with the SDK's mdbg_* debug calls, and writes the 3
+ *     bytes either with mdbg or, on firmware that refuses that (>= 8.40),
+ *     through the kernel direct map (see ptwalk.c), so no separate debugger
+ *     payload is needed,
+ *   - changes those 3 bytes in the RDR2 process only, and only after the 61
+ *     bytes around them match the clean 1.32 eboot exactly, then reads back,
  *   - shows system notifications and writes its own log file,
- *   - exits. No kernel patches, no other process touched, nothing resident,
- *     no files changed besides its own log. */
+ *   - exits. It does not patch the kernel, touch any other process, stay
+ *     resident, or change any file besides its own log. */
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
+#ifndef HOST_TEST
+#include <sys/syscall.h>
+#include <sys/sysctl.h>
+#include <sys/user.h>
+#include "ptwalk.h"
+#endif
+
+#include <ps5/kernel.h>
 #include <ps5/klog.h>
+#include <ps5/mdbg.h>
 
 #define TOOL_VERSION "1.0"
+
+/* process name shown by payload managers (PLDMGR lists processes whose name
+ * ends in .elf; the kernel keeps at most 19 characters) */
+#define PROC_NAME "rdr260fps.elf"
 
 /* ---------------------------------------------------------------- config */
 
@@ -59,43 +76,30 @@ static const uint8_t PATCH_NEW[PATCH_LEN]  = {0x31, 0xf6, 0x90}; /* xor esi,esi;
 #endif
 #define LOG_PATH LOG_DIR "/rdr2-60fps.log"
 
-#ifndef DBG_PORT
-#define DBG_PORT  744
+/* where the system keeps each installed title's param.sfo */
+#ifndef APPMETA_DIR
+#define APPMETA_DIR "/system_data/priv/appmeta"
 #endif
 #define LOCK_PORT 47960 /* loopback UDP port held as a single-instance lock */
 
-#define CONNECT_TRIES   60      /* x 1 s: wait for ps5debug-NG to come up */
 #define POLL_USEC       500000u /* foreground poll, as in the tested original */
 #define WAIT_POLLS      1200    /* x 0.5 s = 10 min */
-#define RECONNECT_TRIES 5
+#define LIST_TRIES      5       /* process list failures in a row */
 #define RESOLVE_TRIES   10      /* x 0.3 s: game memory not ready yet */
 #define RESOLVE_USEC    300000u
 #define WRITE_TRIES     3
 #define WRITE_USEC      200000u
 
-/* ps5debug-NG wire protocol (see its PROTOCOL.md) */
-#define PACKET_MAGIC       0xFFAABBCCu
-#define WIRE_SUCCESS       0x80000000u
-#define CMD_VERSION        0xBD000001u
-#define CMD_FW_VERSION     0xBD000500u
-#define CMD_PROC_READ      0xBDAA0002u
-#define CMD_PROC_WRITE     0xBDAA0003u
-#define CMD_PROC_MAPS      0xBDAA0004u
-#define CMD_FG_APP         0xBDDD0006u
-#define FG_APP_RESP_LEN    140
-#define MAPS_ENTRY_LEN     58
-#define PROT_EXEC          0x4u
-
 enum {
     EXIT_OK = 0,
     EXIT_ALREADY_RUNNING = 1,
-    EXIT_NO_DEBUGGER = 2,
+    /* 2 was "ps5debug-NG not found", no longer possible */
     EXIT_NO_GAME = 3,
     EXIT_BAD_VERSION = 4,
     EXIT_NO_TARGET = 5,
     EXIT_UNEXPECTED = 6,
     EXIT_WRITE_FAIL = 7,
-    EXIT_LOST_DEBUGGER = 8,
+    EXIT_NO_PROC_LIST = 8,
 };
 
 /* --------------------------------------------------------- notifications */
@@ -140,17 +144,30 @@ static void logmsg(const char *lvl, const char *fmt, ...) {
     klog_printf("[rdr2-60fps] %s %s\n", lvl, msg);
 }
 
-static void notify(const char *fmt, ...) {
+static void send_notification(const char *prefix, const char *fmt, va_list ap) {
     notify_request_t req;
-    va_list ap;
     memset(&req, 0, sizeof(req));
-    strcpy(req.message, "RDR2 60fps: ");
-    va_start(ap, fmt);
+    strcpy(req.message, prefix);
     vsnprintf(req.message + strlen(req.message),
               sizeof(req.message) - strlen(req.message), fmt, ap);
-    va_end(ap);
     logmsg("NOTE", "%s", req.message);
     sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}
+
+/* "RDR2 60fps: ..." */
+static void notify(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    send_notification("RDR2 60fps: ", fmt, ap);
+    va_end(ap);
+}
+
+/* as is, no prefix */
+static void notify_plain(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    send_notification("", fmt, ap);
+    va_end(ap);
 }
 
 /* ------------------------------------------------------- single instance */
@@ -174,17 +191,44 @@ static int lock_instance(void) {
     return 0;
 }
 
-/* -------------------------------------------------------- debugger link */
+/* ---------------------------------------------------------- game access */
 
-static int g_sock = -1;
+struct fg_info {
+    uint32_t pid;       /* 0 when no game is running */
+    char titleid[16];
+    char app_ver[16];   /* "" when param.sfo couldn't be read */
+};
 
-static void put32le(uint8_t *p, uint32_t v) {
-    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
-    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+static int proc_read(uint32_t pid, uint64_t addr, uint8_t *out, uint32_t len) {
+    return mdbg_copyout((pid_t)pid, (intptr_t)addr, out, len) ? -1 : 0;
 }
 
-static void put64le(uint8_t *p, uint64_t v) {
-    put32le(p, (uint32_t)v); put32le(p + 4, (uint32_t)(v >> 32));
+static int proc_write(uint32_t pid, uint64_t addr, const uint8_t *data,
+                      uint32_t len) {
+#ifndef HOST_TEST
+    /* firmware >= 8.40 refuses the mdbg write for game code, so the DMAP path
+     * is tried first there (the same gate ps5debug-NG applies) */
+    if ((kernel_get_fw_version() & 0xffff0000u) >= 0x08400000u) {
+        int rc = ptwalk_write(pid, addr, data, len);
+        if (rc == PTWALK_OK)
+            return 0;
+        logmsg("WARN", "DMAP write failed (rc %d), trying mdbg", rc);
+    }
+#endif
+    return mdbg_copyin((pid_t)pid, data, (intptr_t)addr, len) ? -1 : 0;
+}
+
+/* load address of the game's eboot.bin, from the kernel's module list */
+static int eboot_base(uint32_t pid, uint64_t *base) {
+    uint32_t handle;
+    intptr_t b;
+    if (kernel_dynlib_handle((pid_t)pid, "eboot.bin", &handle))
+        return -1;
+    b = kernel_dynlib_mapbase_addr((pid_t)pid, handle);
+    if (b <= 0)
+        return -1;
+    *base = (uint64_t)b;
+    return 0;
 }
 
 static uint32_t get32le(const uint8_t *p) {
@@ -192,187 +236,119 @@ static uint32_t get32le(const uint8_t *p) {
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-static uint64_t get64le(const uint8_t *p) {
-    return get32le(p) | ((uint64_t)get32le(p + 4) << 32);
-}
+/* sceKernelGetAppInfo's layout differs between firmwares (on 13.60 the title
+ * id is 4 bytes earlier than in the SDK sample), so it's read as raw bytes
+ * and searched. Generous size: the call writes about 0x60 bytes. */
+#define APP_INFO_LEN 0x100
 
-static void dbg_close(void) {
-    if (g_sock >= 0) {
-        close(g_sock);
-        g_sock = -1;
+int sceKernelGetAppInfo(pid_t pid, void *info);
+
+#ifndef HOST_TEST
+/* the running game is the process named eboot.bin (one at a time) */
+static int find_game(uint32_t *pid, uint8_t info[APP_INFO_LEN]) {
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
+    size_t size = 0;
+    uint8_t *buf, *p;
+    if (sysctl(mib, 4, NULL, &size, NULL, 0) || !(buf = malloc(size)))
+        return -1;
+    if (sysctl(mib, 4, buf, &size, NULL, 0)) {
+        free(buf);
+        return -1;
     }
+    *pid = 0;
+    for (p = buf; p < buf + size;) {
+        struct kinfo_proc *ki = (struct kinfo_proc *)p;
+        if (ki->ki_structsize <= 0)
+            break;
+        p += ki->ki_structsize;
+        if (strncmp(ki->ki_comm, "eboot.bin", 9) || ki->ki_pid <= 0)
+            continue;
+        memset(info, 0, APP_INFO_LEN);
+        if (sceKernelGetAppInfo(ki->ki_pid, info))
+            continue;
+        *pid = (uint32_t)ki->ki_pid;
+        break;
+    }
+    free(buf);
+    return 0;
 }
+#else
+int find_game(uint32_t *pid, uint8_t info[APP_INFO_LEN]); /* test/stub */
+#endif
 
-/* any protocol error leaves the stream in an unknown state: drop it so the
- * next command starts on a fresh connection */
-static int dbg_fail(void) {
-    dbg_close();
+/* first "ABCD12345" (4 capitals + 5 digits) in the app info, or -1 */
+static int find_titleid(const uint8_t *info, size_t len, char out[16]) {
+    size_t i, k;
+    for (i = 0; i + 9 <= len; i++) {
+        for (k = 0; k < 9; k++) {
+            uint8_t c = info[i + k];
+            if (k < 4 ? (c < 'A' || c > 'Z') : (c < '0' || c > '9'))
+                break;
+        }
+        if (k == 9 && (i + 9 == len || info[i + 9] < '0' || info[i + 9] > '9')) {
+            memcpy(out, info + i, 9);
+            out[9] = 0;
+            return 0;
+        }
+    }
     return -1;
 }
 
-static int dbg_connect(void) {
-    struct sockaddr_in sa;
-    struct timeval tv = {10, 0};
-    dbg_close();
-    g_sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_sock < 0)
+/* string value of key in a param.sfo image, or -1 */
+static int sfo_get(const uint8_t *sfo, size_t len, const char *key, char *out,
+                   size_t outlen) {
+    uint32_t keys, data, n, i;
+    if (len < 20 || memcmp(sfo, "\0PSF", 4))
         return -1;
-    setsockopt(g_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(g_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-    memset(&sa, 0, sizeof(sa));
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(DBG_PORT);
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (connect(g_sock, (struct sockaddr *)&sa, sizeof(sa)))
-        return dbg_fail();
-    return 0;
-}
-
-static int dbg_ensure(void) {
-    return g_sock >= 0 ? 0 : dbg_connect();
-}
-
-/* read exactly n bytes or fail */
-static int recvn(uint8_t *buf, size_t n) {
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = recv(g_sock, (char *)buf + got, n - got, 0);
-        if (r <= 0)
-            return -1;
-        got += (size_t)r;
-    }
-    return 0;
-}
-
-static int sendn(const uint8_t *buf, size_t n) {
-    size_t sent = 0;
-    while (sent < n) {
-        ssize_t r = send(g_sock, (const char *)buf + sent, n - sent, 0);
-        if (r <= 0)
-            return -1;
-        sent += (size_t)r;
-    }
-    return 0;
-}
-
-static int cmd(uint32_t id, const uint8_t *body, uint32_t len) {
-    uint8_t h[12];
-    if (dbg_ensure())
+    keys = get32le(sfo + 8);
+    data = get32le(sfo + 12);
+    n = get32le(sfo + 16);
+    if (keys > len || data > len || n > (len - 20) / 16)
         return -1;
-    put32le(h, PACKET_MAGIC); put32le(h + 4, id); put32le(h + 8, len);
-    if (sendn(h, 12) || (len && sendn(body, len)))
-        return dbg_fail();
-    return 0;
+    for (i = 0; i < n; i++) {
+        const uint8_t *e = sfo + 20 + i * 16;
+        uint32_t koff = keys + (uint32_t)(e[0] | (e[1] << 8));
+        uint32_t dlen = get32le(e + 4), doff = data + get32le(e + 12);
+        if (koff >= len || strnlen((const char *)sfo + koff, len - koff) ==
+                               len - koff)
+            return -1;
+        if (strcmp((const char *)sfo + koff, key))
+            continue;
+        if (doff > len || dlen > len - doff || !dlen || dlen > outlen)
+            return -1;
+        memcpy(out, sfo + doff, dlen);
+        out[dlen - 1] = 0;
+        return 0;
+    }
+    return -1;
 }
 
-static int expect_success(void) {
-    uint8_t b[4];
-    if (recvn(b, 4) || get32le(b) != WIRE_SUCCESS)
-        return dbg_fail();
-    return 0;
+/* installed version: the higher of APP_VER and VERSION; "" if unknown */
+static void read_app_ver(const char *titleid, char out[16]) {
+    static uint8_t sfo[16384];
+    char path[128], a[16] = "", v[16] = "";
+    size_t len;
+    FILE *f;
+    out[0] = 0;
+    snprintf(path, sizeof(path), APPMETA_DIR "/%s/param.sfo", titleid);
+    if (!(f = fopen(path, "rb"))) {
+        logmsg("WARN", "can't open %s", path);
+        return;
+    }
+    len = fread(sfo, 1, sizeof(sfo), f);
+    fclose(f);
+    sfo_get(sfo, len, "APP_VER", a, sizeof(a));
+    sfo_get(sfo, len, "VERSION", v, sizeof(v));
+    strcpy(out, strcmp(a, v) >= 0 ? a : v);
 }
-
-/* protocol version string, e.g. "1.3" (no status word) */
-static int dbg_version(char out[32]) {
-    uint8_t b[4];
-    uint32_t len;
-    if (cmd(CMD_VERSION, NULL, 0) || recvn(b, 4))
-        return dbg_fail();
-    len = get32le(b);
-    if (len >= 32 || recvn((uint8_t *)out, len))
-        return dbg_fail();
-    out[len] = 0;
-    return 0;
-}
-
-/* firmware as decimal, e.g. 1360 for 13.60 (no status word) */
-static int dbg_fw(unsigned *fw) {
-    uint8_t b[2];
-    if (cmd(CMD_FW_VERSION, NULL, 0) || recvn(b, 2))
-        return dbg_fail();
-    *fw = (unsigned)b[0] | ((unsigned)b[1] << 8);
-    return 0;
-}
-
-struct fg_info {
-    uint32_t pid;       /* 0 when no game is in front */
-    char titleid[16];
-    char app_ver[16];
-};
 
 static int fg_app(struct fg_info *fg) {
-    uint8_t resp[FG_APP_RESP_LEN];
-    if (cmd(CMD_FG_APP, NULL, 0) || expect_success() ||
-        recvn(resp, sizeof(resp)))
-        return dbg_fail();
-    fg->pid = get32le(resp);
-    memcpy(fg->titleid, resp + 4, 16);
-    fg->titleid[15] = 0;
-    memcpy(fg->app_ver, resp + 124, 16);
-    fg->app_ver[15] = 0;
-    return 0;
-}
-
-static int proc_read(uint32_t pid, uint64_t addr, uint8_t *out, uint32_t len) {
-    uint8_t b[16];
-    put32le(b, pid); put64le(b + 4, addr); put32le(b + 12, len);
-    if (cmd(CMD_PROC_READ, b, 16) || expect_success() || recvn(out, len))
-        return dbg_fail();
-    return 0;
-}
-
-static int proc_write(uint32_t pid, uint64_t addr, const uint8_t *data,
-                      uint32_t len) {
-    uint8_t b[16];
-    put32le(b, pid); put64le(b + 4, addr); put32le(b + 12, len);
-    if (cmd(CMD_PROC_WRITE, b, 16) || expect_success() || sendn(data, len) ||
-        expect_success())
-        return dbg_fail();
-    return 0;
-}
-
-/* local memmem in case the payload libc lacks it */
-static const void *local_memmem(const void *h, size_t hlen, const void *n,
-                                size_t nlen) {
-    const uint8_t *hh = h;
-    size_t i;
-    if (!nlen || nlen > hlen)
-        return NULL;
-    for (i = 0; i + nlen <= hlen; i++)
-        if (!memcmp(hh + i, n, nlen))
-            return hh + i;
-    return NULL;
-}
-
-/* base = start of the lowest large executable mapping (home of .text) */
-static int eboot_base(uint32_t pid, uint64_t *base) {
-    uint8_t b[4], e[MAPS_ENTRY_LEN];
-    uint64_t best = 0;
-    uint32_t num, i;
-    put32le(b, pid);
-    if (cmd(CMD_PROC_MAPS, b, 4) || expect_success() || recvn(b, 4))
-        return dbg_fail();
-    num = get32le(b);
-    if (num > 100000)
-        return dbg_fail(); /* garbage: stream out of sync */
-    for (i = 0; i < num; i++) {
-        uint64_t start, end;
-        uint16_t prot;
-        if (recvn(e, sizeof(e)))
-            return dbg_fail();
-        start = get64le(e + 32);
-        end = get64le(e + 40);
-        prot = (uint16_t)(e[56] | (e[57] << 8));
-        if (!(prot & PROT_EXEC) || end - start < 0x1000000) /* .text is tens of MB */
-            continue;
-        if (!local_memmem(e, 32, "executable", 10))
-            continue;
-        if (!best || start < best)
-            best = start;
-    }
-    if (!best)
+    uint8_t info[APP_INFO_LEN];
+    memset(fg, 0, sizeof(*fg));
+    if (find_game(&fg->pid, info))
         return -1;
-    *base = best;
+    if (fg->pid && find_titleid(info, sizeof(info), fg->titleid))
+        strcpy(fg->titleid, "?");
     return 0;
 }
 
@@ -478,26 +454,27 @@ static int apply_patch(uint32_t pid, uint64_t target, unsigned *tries) {
     return -1;
 }
 
-/* Poll the foreground app until a supported RDR2 title shows up.
- * Returns 0 (found), 1 (timed out) or -1 (lost ps5debug-NG). */
+/* Poll the running game until a supported RDR2 title shows up.
+ * Returns 0 (found), 1 (timed out) or -1 (process list unavailable). */
 static int wait_for_game(struct fg_info *fg, int *already_open) {
     unsigned poll, fails = 0;
     uint32_t last_pid = 0;
     for (poll = 0; poll < WAIT_POLLS; poll++) {
         if (fg_app(fg)) {
-            if (++fails > RECONNECT_TRIES)
+            if (++fails > LIST_TRIES)
                 return -1;
-            logmsg("WARN", "foreground query failed (%u/%u), reconnecting", fails,
-                   RECONNECT_TRIES);
+            logmsg("WARN", "process list failed (%u/%u)", fails, LIST_TRIES);
             sleep(1);
             continue;
         }
         fails = 0;
         if (fg->pid && is_wanted_title(fg->titleid)) {
             *already_open = (poll == 0);
+            read_app_ver(fg->titleid, fg->app_ver);
             return 0;
         }
         if (fg->pid && fg->pid != last_pid) {
+            read_app_ver(fg->titleid, fg->app_ver);
             logmsg("INFO", "other app in front: %s v%s (pid %u)", fg->titleid,
                    fg->app_ver, fg->pid);
             notify("%s is not RDR2, still waiting", fg->titleid);
@@ -512,7 +489,6 @@ static int wait_for_game(struct fg_info *fg, int *already_open) {
 
 static int finish(int code) {
     logmsg("INFO", "exit code %d", code);
-    dbg_close();
     if (g_lock >= 0)
         close(g_lock);
     if (g_log)
@@ -524,16 +500,17 @@ int main(void) {
     struct fg_info fg;
     uint8_t ctx[64];
     uint64_t target;
-    unsigned fw, tries, i;
+    unsigned tries;
     unsigned long found_ms;
     int already_open = 0, mismatch, rc;
-    char ver[32];
     char when[32] = "?";
     time_t now = time(NULL);
     struct tm tm;
 
     clock_gettime(CLOCK_MONOTONIC, &g_t0);
-    signal(SIGPIPE, SIG_IGN); /* a dropped connection must not kill us */
+#ifndef HOST_TEST
+    syscall(SYS_thr_set_name, -1, PROC_NAME); /* else it's "payload.elf" */
+#endif
 
     /* lock before opening the log, so a second copy can't truncate it */
     if (lock_instance()) {
@@ -546,30 +523,15 @@ int main(void) {
     logmsg("INFO", "rdr2-60fps v%s started %s", TOOL_VERSION, when);
     logmsg("INFO", "log: %s", g_log ? LOG_PATH : "(could not open)");
 
-    /* 1) ps5debug-NG */
-    for (i = 1; dbg_connect(); i++) {
-        if (i == 1)
-            notify("waiting for ps5debug-NG (port %d)...", DBG_PORT);
-        if (i >= CONNECT_TRIES) {
-            notify("ps5debug-NG not found. Load it first, then this payload. "
-                   "Nothing changed.");
-            return finish(EXIT_NO_DEBUGGER);
-        }
-        logmsg("WARN", "connect try %u/%u failed", i, CONNECT_TRIES);
-        sleep(1);
-    }
-    logmsg("OK", "connected to ps5debug-NG (try %u)", i);
-    if (!dbg_version(ver))
-        logmsg("INFO", "ps5debug-NG protocol %s", ver);
-    if (!dbg_fw(&fw))
-        logmsg("INFO", "console firmware %u.%02u", fw / 100, fw % 100);
+    logmsg("INFO", "console firmware %x.%02x", kernel_get_fw_version() >> 24,
+           (kernel_get_fw_version() >> 16) & 0xff);
 
-    /* 2) wait for the game */
+    /* 1) wait for the game */
     notify("ready. Start Red Dead Redemption 2 (waiting up to 10 min)");
     rc = wait_for_game(&fg, &already_open);
     if (rc < 0) {
-        notify("lost connection to ps5debug-NG. Nothing changed.");
-        return finish(EXIT_LOST_DEBUGGER);
+        notify("couldn't list running apps. Nothing changed.");
+        return finish(EXIT_NO_PROC_LIST);
     }
     if (rc > 0) {
         notify("RDR2 was not started within 10 min. Closed, nothing changed.");
@@ -579,7 +541,7 @@ int main(void) {
     logmsg("OK", "RDR2 found: %s v%s pid %u%s", fg.titleid, fg.app_ver, fg.pid,
            already_open ? " (was already open)" : "");
 
-    /* 3) version gate: the patch is for 1.32 only */
+    /* 2) version gate: the patch is for 1.32 only */
     if (!fg.app_ver[0]) {
         logmsg("WARN", "game version unknown, relying on the byte check");
     } else if (strncmp(fg.app_ver, WANT_APP_VER, strlen(WANT_APP_VER))) {
@@ -589,7 +551,7 @@ int main(void) {
     }
     notify("found %s v%s, patching...", fg.titleid, fg.app_ver);
 
-    /* 4) locate and verify the patch site */
+    /* 3) locate and verify the patch site */
     if (resolve_target(fg.pid, &target, ctx, &tries, &mismatch)) {
         if (mismatch)
             notify("game code doesn't match the 1.32 patch. Nothing changed.");
@@ -608,7 +570,7 @@ int main(void) {
         return finish(EXIT_UNEXPECTED);
     }
 
-    /* 5) write + read back */
+    /* 4) write + read back */
     rc = apply_patch(fg.pid, target, &tries);
     if (rc == -2) {
         notify("bytes changed under us. Nothing changed.");
@@ -624,7 +586,6 @@ int main(void) {
         notify("applied, but RDR2 was already open. If it stays at 30fps: "
                "close the game, load this payload again, then start RDR2.");
     else
-        notify("60fps ON (try %u). Patch by Jao, original tool by KurohaXR",
-               tries);
+        notify_plain("60FPS IS ON, Enjoy.\nMade by Arman with \u2764\ufe0f");
     return finish(EXIT_OK);
 }
